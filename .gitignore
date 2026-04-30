@@ -1,0 +1,11 @@
+# ELD Trip Planner
+
+node_modules/
+frontend/dist/
+backend/venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/staticfiles/
+*.pyc
+.env
+.DS_Store
