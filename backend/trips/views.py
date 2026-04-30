@@ -1,6 +1,8 @@
 """API views for trip planning."""
 import json
+import math
 import subprocess
+import time
 from datetime import datetime
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
@@ -11,17 +13,23 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
 
 
-def _curl_get(url):
-    """Use system curl to bypass Python's broken SSL."""
-    try:
-        result = subprocess.run(
-            ['curl', '-s', '-S', '--max-time', '15', url],
-            capture_output=True, text=True, timeout=20
-        )
-        if result.returncode == 0 and result.stdout:
-            return json.loads(result.stdout)
-    except Exception as e:
-        print(f"Curl error: {e}")
+def _curl_get(url, retries=2):
+    """Use system curl to bypass Python's broken SSL. Retry on failure."""
+    for attempt in range(retries + 1):
+        try:
+            result = subprocess.run(
+                ['curl', '-s', '-S', '--max-time', '15',
+                 '-H', 'User-Agent: ELDTripPlanner/1.0', url],
+                capture_output=True, text=True, timeout=20
+            )
+            if result.returncode == 0 and result.stdout.strip().startswith('{'):
+                return json.loads(result.stdout)
+            elif result.returncode == 0 and result.stdout.strip().startswith('['):
+                return json.loads(result.stdout)
+        except Exception as e:
+            print(f"Curl attempt {attempt+1} error: {e}")
+        if attempt < retries:
+            time.sleep(1)
     return None
 
 
@@ -40,11 +48,34 @@ def geocode_location(query):
     return None
 
 
+def haversine_miles(lat1, lon1, lat2, lon2):
+    """Calculate distance in miles between two lat/lon points."""
+    R = 3958.8  # Earth radius in miles
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (math.sin(dlat/2)**2 +
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
+         math.sin(dlon/2)**2)
+    return R * 2 * math.asin(math.sqrt(a))
+
+
+def generate_intermediate_points(start, end, num_points=50):
+    """Generate intermediate lat/lon points along a great circle path."""
+    points = []
+    for i in range(num_points + 1):
+        t = i / num_points
+        lat = start['lat'] + t * (end['lat'] - start['lat'])
+        lon = start['lon'] + t * (end['lon'] - start['lon'])
+        points.append([lon, lat])
+    return points
+
+
 def get_route(coords_list):
-    """Get route from OSRM between multiple coordinate pairs."""
+    """Get route from OSRM, with fallback to straight-line estimation."""
     coords_str = ";".join(f"{c['lon']},{c['lat']}" for c in coords_list)
     url = f"{OSRM_URL}/{coords_str}?overview=full&geometries=geojson&steps=true&alternatives=false"
     data = _curl_get(url)
+
     if data and data.get('code') == 'Ok' and data.get('routes'):
         route = data['routes'][0]
         legs = []
@@ -65,8 +96,43 @@ def get_route(coords_list):
             'total_distance': route['distance'] / 1609.34,
             'total_duration': route['duration'] / 3600,
         }
-    print(f"OSRM response: {data}")
-    return None
+
+    # Fallback: estimate route using straight-line distance * 1.3 road factor
+    print("OSRM unavailable, using fallback route estimation")
+    ROAD_FACTOR = 1.3
+    AVG_SPEED = 55  # mph
+
+    legs = []
+    all_coords = []
+    total_dist = 0
+    total_dur = 0
+
+    for i in range(len(coords_list) - 1):
+        start = coords_list[i]
+        end = coords_list[i + 1]
+        straight_dist = haversine_miles(start['lat'], start['lon'], end['lat'], end['lon'])
+        road_dist = straight_dist * ROAD_FACTOR
+        road_dur = road_dist / AVG_SPEED
+
+        leg_coords = generate_intermediate_points(start, end, num_points=100)
+        all_coords.extend(leg_coords)
+
+        legs.append({
+            'distance': road_dist,
+            'duration': road_dur,
+            'start_location': [start['lon'], start['lat']],
+            'end_location': [end['lon'], end['lat']],
+            'geometry': leg_coords,
+        })
+        total_dist += road_dist
+        total_dur += road_dur
+
+    return {
+        'legs': legs,
+        'geometry': {'type': 'LineString', 'coordinates': all_coords},
+        'total_distance': total_dist,
+        'total_duration': total_dur,
+    }
 
 
 @api_view(['POST'])
@@ -101,7 +167,7 @@ def plan_trip(request):
     if not dropoff_geo:
         return Response({'error': f'Could not find location: {dropoff_location}'}, status=400)
 
-    # Get route
+    # Get route (with fallback)
     route = get_route([current_geo, pickup_geo, dropoff_geo])
     if not route:
         return Response({'error': 'Could not calculate route. Please try again.'}, status=400)
