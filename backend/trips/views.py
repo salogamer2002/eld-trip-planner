@@ -1,8 +1,10 @@
 """API views for trip planning."""
 import json
 import math
-import subprocess
+import ssl
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
@@ -13,32 +15,29 @@ NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_URL = "https://router.project-osrm.org/route/v1/driving"
 
 
-def _curl_get(url, retries=2):
-    """Use system curl to bypass Python's broken SSL. Retry on failure."""
+def _fetch_json(url, retries=2):
+    """Fetch JSON from a URL using urllib. Works on Railway/cloud."""
     for attempt in range(retries + 1):
         try:
-            result = subprocess.run(
-                ['curl', '-s', '-S', '--max-time', '15',
-                 '-H', 'User-Agent: ELDTripPlanner/1.0', url],
-                capture_output=True, text=True, timeout=20
-            )
-            if result.returncode == 0 and result.stdout.strip().startswith('{'):
-                return json.loads(result.stdout)
-            elif result.returncode == 0 and result.stdout.strip().startswith('['):
-                return json.loads(result.stdout)
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'ELDTripPlanner/1.0'
+            })
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                data = resp.read().decode()
+                return json.loads(data)
         except Exception as e:
-            print(f"Curl attempt {attempt+1} error: {e}")
+            print(f"Fetch attempt {attempt+1} error: {e}")
         if attempt < retries:
-            time.sleep(1)
+            time.sleep(0.5)
     return None
 
 
 def geocode_location(query):
     """Geocode a location string to coordinates using Nominatim."""
-    import urllib.parse
     encoded = urllib.parse.quote(query)
     url = f"{NOMINATIM_URL}?q={encoded}&format=json&limit=1&countrycodes=us"
-    data = _curl_get(url)
+    data = _fetch_json(url)
     if data and len(data) > 0:
         return {
             'lat': float(data[0]['lat']),
@@ -74,7 +73,7 @@ def get_route(coords_list):
     """Get route from OSRM, with fallback to straight-line estimation."""
     coords_str = ";".join(f"{c['lon']},{c['lat']}" for c in coords_list)
     url = f"{OSRM_URL}/{coords_str}?overview=full&geometries=geojson&steps=true&alternatives=false"
-    data = _curl_get(url)
+    data = _fetch_json(url)
 
     if data and data.get('code') == 'Ok' and data.get('routes'):
         route = data['routes'][0]
